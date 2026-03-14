@@ -1,41 +1,50 @@
-name: Build fireware
+name: Build Firmware
+
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
-
+    branches: [ main ]
     paths:
-      - "src/fireware-code/csi-recv-end/**"
-
-
+      - "src/fireware-code/**"
   pull_request:
     paths:
-      - "src/fireware-code/csi-recv-end/**"
+      - "src/fireware-code/**"
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: esp32c6
+            project: src/fireware-code/csi-receiver
+
+          - target: esp32s3
+            project: src/fireware-code/csi-sender
+            
+          - target: esp32p4
+            project: src/fireware-code/motion-inference
+
     steps:
-    - name: Checkout repo
-      uses: actions/checkout@v4
-      with:
-        submodules: 'recursive'
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
-    - name: esp-idf build
-      uses: espressif/esp-idf-ci-action@v1
-      with:
-        esp_idf_version: v5.5.3
-        target: esp32s3
-        path: 'src/fireware-code/csi-recv-end'
+      - name: Build with ESP-IDF
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.5.3
+          target: ${{ matrix.target }}
+          path: ${{ matrix.project }}
 
-
-    - name: Upload firmware artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: firmware-esp32s3
-        path: |
-          src/fireware-code/csi-recv-end/build/*.bin
-        if-no-files-found: warn
-        retention-days: 7
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.target }}
+          path: |
+            ${{ matrix.project }}/build/*.bin
+          if-no-files-found: warn
+          retention-days: 7
