@@ -1,6 +1,8 @@
 #ifndef NN_MODEL_H
 #define NN_MODEL_H
 
+#define NUM_CLASSES 4
+
 #ifdef __cplusplus
 extern "C" {
 #endif

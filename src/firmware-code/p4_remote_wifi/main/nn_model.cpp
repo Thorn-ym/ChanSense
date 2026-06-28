@@ -68,7 +68,7 @@ int nn_model_predict(float x, float y)
     // Find class with the maximum score (argmax)
     int max_class = 0;
     int8_t max_val = output_data[0];
-    for (int c = 1; c < 4; c++) {
+    for (int c = 1; c < NUM_CLASSES; c++) {
         if (output_data[c] > max_val) {
             max_val = output_data[c];
             max_class = c;
@@ -264,10 +264,10 @@ int nn_model_predict_cnn(float *raw_csi)
     // Read output tensor data
     int8_t *output_data = (int8_t *)g_model_output->data;
     
-    // Find class with the maximum score (argmax among 4 classes)
+    // Find class with the maximum score (argmax among classes)
     int max_class = 0;
     int8_t max_val = output_data[0];
-    for (int c = 1; c < 4; c++) {
+    for (int c = 1; c < NUM_CLASSES; c++) {
         if (output_data[c] > max_val) {
             max_val = output_data[c];
             max_class = c;
@@ -316,19 +316,19 @@ int nn_model_predict_cnn_with_probs(float *raw_csi, float *out_probs)
     
     // Calculate Softmax probabilities
     float sum_exp = 0.0f;
-    float float_logits[4];
-    for (int c = 0; c < 4; c++) {
+    float float_logits[NUM_CLASSES];
+    for (int c = 0; c < NUM_CLASSES; c++) {
         float_logits[c] = (float)output_data[c] * output_scale;
         sum_exp += expf(float_logits[c]);
     }
-    for (int c = 0; c < 4; c++) {
+    for (int c = 0; c < NUM_CLASSES; c++) {
         out_probs[c] = expf(float_logits[c]) / sum_exp;
     }
     
     // Find class with the maximum score
     int max_class = 0;
     float max_prob = out_probs[0];
-    for (int c = 1; c < 4; c++) {
+    for (int c = 1; c < NUM_CLASSES; c++) {
         if (out_probs[c] > max_prob) {
             max_prob = out_probs[c];
             max_class = c;

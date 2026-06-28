@@ -170,7 +170,7 @@ static bool read_csi_frame(uint32_t *seq, int8_t *raw_payload, size_t *raw_len)
 #define FUSION_CHANNELS 228
 #define TOTAL_FEATURES (SLIDING_WINDOW_SIZE * FUSION_CHANNELS)
 
-#define MOTION_THRESHOLD 0.18f
+#define MOTION_THRESHOLD 3.0f
 #define DEBOUNCE_FRAMES 15
 #define REQUIRED_TRIGGER_FRAMES 3
 #define MIN_CONFIDENCE 0.80f
@@ -215,7 +215,7 @@ static void parse_and_filter_csi(const int8_t *raw_payload, size_t raw_len, floa
 
 static float calculate_motion_level(const float *window_buf)
 {
-    float cv_sum = 0.0f;
+    float std_sum = 0.0f;
     for (int s = 0; s < NUM_SUBCARRIERS; s++) {
         float sum = 0.0f;
         float sum_sq = 0.0f;
@@ -232,12 +232,9 @@ static float calculate_motion_level(const float *window_buf)
             var = 0.0f;
         }
         float std = sqrtf(var);
-        
-        // 变异系数归一化：除以均值，防止分母为 0 加上微小常数 0.001f
-        float cv = std / (mean + 0.001f);
-        cv_sum += cv;
+        std_sum += std;
     }
-    return cv_sum / (float)NUM_SUBCARRIERS;
+    return std_sum / (float)NUM_SUBCARRIERS;
 }
 
 // ==================== 6. 核心任务定义 ====================
@@ -257,16 +254,21 @@ static void ai_inference_task(void *pvParameters)
     bool local_ended = false;
     
     // 动作周期内概率加权求和及统计变量
-    float accumulated_probs[4] = {0.0f};
+    float accumulated_probs[NUM_CLASSES] = {0.0f};
+    float unweighted_probs[NUM_CLASSES] = {0.0f};
     float total_weight = 0.0f;
     int gesture_frames_count = 0;
     
-    const char *gesture_names[] = {
-        "挥手 (Wave/Cut)",
-        "抓握 (Grip)",
-        "画圈 (Circle/Draw_o)",
-        "未知 (Unknown)"
+    const char *gesture_names[NUM_CLASSES] = {
+        "高抬腿",
+        "展臂",
+        "深蹲"
     };
+    
+    // Real-time smoothing history
+    #define SMOOTHING_FRAMES 7
+    int pred_history[SMOOTHING_FRAMES];
+    int pred_history_count = 0;
     
     while (1) {
         // 无限期阻塞等待Core 0的通知
@@ -287,7 +289,7 @@ static void ai_inference_task(void *pvParameters)
         portEXIT_CRITICAL(&sync_mux);
         
         if (request) {
-            float probs[4] = {0.0f};
+            float probs[NUM_CLASSES] = {0.0f};
             int64_t start = esp_timer_get_time();
             int pred_class = nn_model_predict_cnn_with_probs(local_input, probs);
             int64_t end = esp_timer_get_time();
@@ -297,19 +299,48 @@ static void ai_inference_task(void *pvParameters)
             // 计算加权系数 (motion_val - threshold)^2
             float weight = (local_motion_val - MOTION_THRESHOLD) * (local_motion_val - MOTION_THRESHOLD);
             
-            // 过滤置信度低于0.50且排除未知手势的帧，参与最终的决策累加
-            if (confidence >= 0.50f && pred_class != 3) {
-                for (int c = 0; c < 4; c++) {
+            // 过滤置信度低于0.50的帧，参与最终的决策累加
+            if (confidence >= 0.50f) {
+                for (int c = 0; c < NUM_CLASSES; c++) {
                     accumulated_probs[c] += probs[c] * weight;
+                    unweighted_probs[c] += probs[c];
                 }
                 total_weight += weight;
                 gesture_frames_count++;
             }
             
-            // 实时打印满足最小置信度的高可靠预测结果
+            // 检查置信度是否大于等于阈值以推入平滑历史
             if (confidence >= MIN_CONFIDENCE) {
+                if (pred_history_count < SMOOTHING_FRAMES) {
+                    pred_history[pred_history_count++] = pred_class;
+                } else {
+                    for (int i = 0; i < SMOOTHING_FRAMES - 1; i++) {
+                        pred_history[i] = pred_history[i + 1];
+                    }
+                    pred_history[SMOOTHING_FRAMES - 1] = pred_class;
+                }
+            }
+            
+            // 根据平滑历史投票决定当前预测输出
+            int smoothed_class = -1;
+            if (pred_history_count > 0) {
+                int counts[NUM_CLASSES] = {0};
+                for (int i = 0; i < pred_history_count; i++) {
+                    counts[pred_history[i]]++;
+                }
+                int max_count = 0;
+                for (int c = 0; c < NUM_CLASSES; c++) {
+                    if (counts[c] > max_count) {
+                        max_count = counts[c];
+                        smoothed_class = c;
+                    }
+                }
+            }
+            
+            if (smoothed_class != -1) {
+                const char *name = (smoothed_class < NUM_CLASSES && gesture_names[smoothed_class]) ? gesture_names[smoothed_class] : "Unknown";
                 ESP_LOGI(TAG, "🔴 [ACTIVE] Real-time Pred: %s (Conf: %.1f%%, Motion: %.2f, Time: %lld us)", 
-                         gesture_names[pred_class], confidence * 100.0f, local_motion_val, (end - start));
+                         name, confidence * 100.0f, local_motion_val, (end - start));
             } else {
                 ESP_LOGI(TAG, "🔴 [ACTIVE] Real-time Pred: UNCERTAIN (Motion: %.2f)", local_motion_val);
             }
@@ -317,15 +348,21 @@ static void ai_inference_task(void *pvParameters)
         
         if (local_ended) {
             // 动作结束，进行加权总决策
-            if (gesture_frames_count > 0 && total_weight > 0.0f) {
-                float final_probs[4];
-                for (int c = 0; c < 4; c++) {
-                    final_probs[c] = accumulated_probs[c] / total_weight;
+            if (gesture_frames_count > 0) {
+                float final_probs[NUM_CLASSES];
+                if (total_weight > 0.0f) {
+                    for (int c = 0; c < NUM_CLASSES; c++) {
+                        final_probs[c] = accumulated_probs[c] / total_weight;
+                    }
+                } else {
+                    for (int c = 0; c < NUM_CLASSES; c++) {
+                        final_probs[c] = unweighted_probs[c] / (float)gesture_frames_count;
+                      }
                 }
-                // 在前三种动作分类中寻找最大概率值 (argmax over classes 0, 1, 2)
+                // 在所有动作分类中寻找最大概率值 (argmax over classes)
                 int final_class = 0;
                 float max_prob = final_probs[0];
-                for (int c = 1; c < 3; c++) {
+                for (int c = 1; c < NUM_CLASSES; c++) {
                     if (final_probs[c] > max_prob) {
                         max_prob = final_probs[c];
                         final_class = c;
@@ -333,10 +370,12 @@ static void ai_inference_task(void *pvParameters)
                 }
                 
                 ESP_LOGI(TAG, "================ GESTURE DETECTED ================");
-                ESP_LOGI(TAG, "🏆🏆🏆 Final Result: %s (Score: %.1f%%)", gesture_names[final_class], max_prob * 100.0f);
-                ESP_LOGI(TAG, "      - Wave/Cut  Prob: %.2f%%", final_probs[0] * 100.0f);
-                ESP_LOGI(TAG, "      - Grip      Prob: %.2f%%", final_probs[1] * 100.0f);
-                ESP_LOGI(TAG, "      - Circle    Prob: %.2f%%", final_probs[2] * 100.0f);
+                const char *final_name = (final_class < NUM_CLASSES && gesture_names[final_class]) ? gesture_names[final_class] : "Unknown";
+                ESP_LOGI(TAG, "🏆🏆🏆 Final Result: %s (Score: %.1f%%)", final_name, max_prob * 100.0f);
+                for (int c = 0; c < NUM_CLASSES; c++) {
+                    const char *name = (c < NUM_CLASSES && gesture_names[c]) ? gesture_names[c] : "Unknown";
+                    ESP_LOGI(TAG, "      - Class %d (%s) Prob: %.2f%%", c, name, final_probs[c] * 100.0f);
+                }
                 ESP_LOGI(TAG, "      - Accum Frames: %d, Total Weight: %.2f", gesture_frames_count, total_weight);
                 ESP_LOGI(TAG, "==================================================");
             } else {
@@ -345,10 +384,12 @@ static void ai_inference_task(void *pvParameters)
                 ESP_LOGI(TAG, "==================================================");
             }
             
-            // 重置累加状态
+            // 重置累加状态与平滑历史
             memset(accumulated_probs, 0, sizeof(accumulated_probs));
+            memset(unweighted_probs, 0, sizeof(unweighted_probs));
             total_weight = 0.0f;
             gesture_frames_count = 0;
+            pred_history_count = 0;
         }
     }
 }

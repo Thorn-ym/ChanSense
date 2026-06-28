@@ -221,7 +221,7 @@ static void ai_inference_task(void *pvParameters)
     ESP_LOGI(TAG, "Starting AI Inference Task on Core %d...", xPortGetCoreID());
     float *input_features = NULL;
     
-    const char *gesture_names[] = {
+    const char *gesture_names[NUM_CLASSES] = {
         "挥手 (Wave/Cut)",
         "抓握 (Grip)",
         "画圈 (Circle/Draw_o)",
@@ -238,9 +238,10 @@ static void ai_inference_task(void *pvParameters)
             int pred_class = nn_model_predict_cnn(input_features);
             int64_t end = esp_timer_get_time();
             
-            if (pred_class >= 0 && pred_class < 4) {
+            if (pred_class >= 0 && pred_class < NUM_CLASSES) {
+                const char *name = gesture_names[pred_class] ? gesture_names[pred_class] : "Unknown";
                 ESP_LOGI(TAG, ">> Inference Result: %s (Time taken: %lld us)", 
-                         gesture_names[pred_class], (end - start));
+                         name, (end - start));
             } else {
                 ESP_LOGE(TAG, "Inference failed with code: %d", pred_class);
             }
