@@ -5,179 +5,22 @@
 #include <inttypes.h>
 #include <math.h>
 
-#include "driver/uart.h"
-#include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+
+// 引入重构后的各个子组件
+#include "sys_config.h"
+#include "csi_receiver.h"
+#include "motion_detector.h"
+#include "output_dispatcher.h"
 #include "nn_model.h"
 
-static const char *TAG = "csi_receiver";
+static const char *TAG = "csi_main";
 
-// ==================== 1. 串口配置参数 ====================
-#define CSI_UART_NUM            UART_NUM_1
-#define CSI_UART_RX_GPIO        GPIO_NUM_21
-#define CSI_UART_TX_GPIO        GPIO_NUM_22
-#define CSI_UART_BAUD_RATE      921600
-#define CSI_UART_RX_BUFFER_SIZE (16 * 1024)
-
-// ==================== 2. 数据协议帧定义 ====================
-static const uint8_t CSI_FRAME_MAGIC[4] = {'C', 'S', 'I', '1'};
-#define CSI_FRAME_MAX_RAW_LEN   1024
-#define CSI_FRAME_HEADER_SIZE   10
-#define CSI_FRAME_CHECKSUM_SIZE 2
-
-// ==================== 3. 辅助转换函数 ====================
-static uint16_t read_le16(const uint8_t *src)
-{
-    return ((uint16_t)src[0]) | (((uint16_t)src[1]) << 8);
-}
-
-static uint32_t read_le32(const uint8_t *src)
-{
-    return ((uint32_t)src[0]) |
-           (((uint32_t)src[1]) << 8) |
-           (((uint32_t)src[2]) << 16) |
-           (((uint32_t)src[3]) << 24);
-}
-
-// ==================== 4. 驱动与接收逻辑 ====================
-static esp_err_t init_csi_uart(void)
-{
-    const uart_config_t uart_config = {
-        .baud_rate = CSI_UART_BAUD_RATE,
-        .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .rx_flow_ctrl_thresh = 0,
-        .source_clk = UART_SCLK_DEFAULT,
-    };
-
-    esp_err_t ret = uart_driver_install(CSI_UART_NUM, CSI_UART_RX_BUFFER_SIZE, 0, 0, NULL, 0);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "failed to install CSI UART driver: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    ret = uart_param_config(CSI_UART_NUM, &uart_config);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "failed to configure CSI UART: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    ret = uart_set_pin(CSI_UART_NUM,
-                       CSI_UART_TX_GPIO,
-                       CSI_UART_RX_GPIO,
-                       UART_PIN_NO_CHANGE,
-                       UART_PIN_NO_CHANGE);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "failed to set CSI UART pins: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    ESP_LOGI(TAG,
-             "CSI UART%d initialized: RX GPIO%d, TX GPIO%d, baud=%d",
-             CSI_UART_NUM,
-             CSI_UART_RX_GPIO,
-             CSI_UART_TX_GPIO,
-             CSI_UART_BAUD_RATE);
-    return ESP_OK;
-}
-
-static bool uart_read_exact(uint8_t *dst, size_t len)
-{
-    size_t received = 0;
-    while (received < len) {
-        const int ret = uart_read_bytes(CSI_UART_NUM,
-                                        dst + received,
-                                        len - received,
-                                        pdMS_TO_TICKS(1000));
-        if (ret < 0) {
-            ESP_LOGE(TAG, "CSI UART read failed");
-            return false;
-        }
-        received += (size_t)ret;
-    }
-    return true;
-}
-
-static bool read_csi_frame(uint32_t *seq, int8_t *raw_payload, size_t *raw_len)
-{
-    uint8_t frame_header[CSI_FRAME_HEADER_SIZE] = {0};
-    size_t matched = 0;
-
-    while (matched < sizeof(CSI_FRAME_MAGIC)) {
-        uint8_t byte = 0;
-        if (!uart_read_exact(&byte, 1)) {
-            return false;
-        }
-
-        if (byte == CSI_FRAME_MAGIC[matched]) {
-            frame_header[matched++] = byte;
-        } else {
-            matched = (byte == CSI_FRAME_MAGIC[0]) ? 1 : 0;
-            if (matched == 1) {
-                frame_header[0] = byte;
-            }
-        }
-    }
-
-    if (!uart_read_exact(frame_header + sizeof(CSI_FRAME_MAGIC),
-                         CSI_FRAME_HEADER_SIZE - sizeof(CSI_FRAME_MAGIC))) {
-        return false;
-    }
-
-    const uint16_t len = read_le16(&frame_header[8]);
-    if (len == 0 || len > CSI_FRAME_MAX_RAW_LEN) {
-        ESP_LOGW(TAG, "invalid raw_len=%u (max=%u)", len, CSI_FRAME_MAX_RAW_LEN);
-        return false;
-    }
-
-    if (!uart_read_exact((uint8_t *)raw_payload, len)) {
-        return false;
-    }
-
-    uint8_t checksum_bytes[CSI_FRAME_CHECKSUM_SIZE] = {0};
-    if (!uart_read_exact(checksum_bytes, sizeof(checksum_bytes))) {
-        return false;
-    }
-
-    uint32_t sum = 0;
-    for (size_t i = 0; i < CSI_FRAME_HEADER_SIZE; ++i) {
-        sum += frame_header[i];
-    }
-    for (size_t i = 0; i < len; ++i) {
-        sum += (uint8_t)raw_payload[i];
-    }
-    const uint16_t expected = read_le16(checksum_bytes);
-    const uint16_t actual = (uint16_t)(sum & 0xffff);
-    if (expected != actual) {
-        ESP_LOGW(TAG, "checksum failed: expected=0x%04x actual=0x%04x", expected, actual);
-        return false;
-    }
-
-    *seq = read_le32(&frame_header[4]);
-    *raw_len = len;
-    return true;
-}
-
-// ==================== 5. 全局变量与核心逻辑 ====================
-#define SLIDING_WINDOW_SIZE 50
-#define NUM_SUBCARRIERS 114
-#define FUSION_CHANNELS 228
-#define TOTAL_FEATURES (SLIDING_WINDOW_SIZE * FUSION_CHANNELS)
-
-#define MOTION_THRESHOLD 3.0f
-#define DEBOUNCE_FRAMES 15
-#define REQUIRED_TRIGGER_FRAMES 3
-#define MIN_CONFIDENCE 0.80f
-
-static float *csi_window = NULL;
-static int csi_window_count = 0;
-
+// ==================== 1. 双核共享的推理双缓冲 ====================
 static float *inference_input_buf = NULL;
 static float inference_motion_val = 0.0f;
 static volatile bool inference_request_pending = false;
@@ -185,59 +28,66 @@ static volatile bool gesture_ended_pending = false;
 static portMUX_TYPE sync_mux = portMUX_INITIALIZER_UNLOCKED;
 static TaskHandle_t ai_task_handle = NULL;
 
-static void parse_and_filter_csi(const int8_t *raw_payload, size_t raw_len, float *out_frame_228)
+static const char *gesture_names[NUM_CLASSES] = {
+    "高抬腿",
+    "展臂",
+    "深蹲"
+};
+
+// ==================== 2. 默认输出处理器（控制台输出） ====================
+static void console_logger_cb(const inference_result_t *res)
 {
-    int num_in = raw_len / 2;
-    int count = 0;
-    for (int i = 0; i < num_in && count < 114; i++) {
-        int8_t imag = raw_payload[2 * i];
-        int8_t real = raw_payload[2 * i + 1];
-        if (real != 0 || imag != 0) {
-            out_frame_228[2 * count] = (float)imag;
-            out_frame_228[2 * count + 1] = (float)real;
-            count++;
-        }
-    }
-    
-    if (count < 114) {
-        if (count > 0) {
-            float last_imag = out_frame_228[2 * (count - 1)];
-            float last_real = out_frame_228[2 * (count - 1) + 1];
-            for (int i = count; i < 114; i++) {
-                out_frame_228[2 * i] = last_imag;
-                out_frame_228[2 * i + 1] = last_real;
-            }
+    if (!res->is_final) {
+        if (res->class_id != -1) {
+            ESP_LOGI(TAG, "🔴 [ACTIVE] Real-time Pred: %s (Conf: %.1f%%, Motion: %.2f, Time: %" PRIu32 " us)", 
+                     res->class_name, res->confidence * 100.0f, res->motion_val, res->execution_time_us);
         } else {
-            memset(out_frame_228, 0, 228 * sizeof(float));
+            ESP_LOGI(TAG, "🔴 [ACTIVE] Real-time Pred: UNCERTAIN (Motion: %.2f)", res->motion_val);
         }
+    } else {
+        ESP_LOGI(TAG, "================ GESTURE DETECTED ================");
+        if (res->class_id != -1) {
+            ESP_LOGI(TAG, "🏆🏆🏆 Final Result: %s (Score: %.1f%%)", res->class_name, res->confidence * 100.0f);
+            for (int c = 0; c < NUM_CLASSES; c++) {
+                const char *name = (c < NUM_CLASSES && gesture_names[c]) ? gesture_names[c] : "Unknown";
+                ESP_LOGI(TAG, "      - Class %d (%s) Prob: %.2f%%", c, name, res->probs[c] * 100.0f);
+            }
+            ESP_LOGI(TAG, "      - Accum Frames: %d, Total Weight: %.2f", res->accum_frames, res->total_weight);
+        } else {
+            ESP_LOGI(TAG, "⚠️⚠️⚠️ Finished, but no high-confidence frames accumulated.");
+        }
+        ESP_LOGI(TAG, "==================================================");
     }
 }
 
-static float calculate_motion_level(const float *window_buf)
+/*
+// ==================== 3. 示例：如何添加其他输出通道 ====================
+// 示例 1: OLED 屏幕异步更新（可能耗时 20-50ms，因此注册为异步，避免拖慢推理）
+static void oled_output_cb(const inference_result_t *res)
 {
-    float std_sum = 0.0f;
-    for (int s = 0; s < NUM_SUBCARRIERS; s++) {
-        float sum = 0.0f;
-        float sum_sq = 0.0f;
-        for (int t = 0; t < SLIDING_WINDOW_SIZE; t++) {
-            float imag = window_buf[t * FUSION_CHANNELS + 2 * s];
-            float real = window_buf[t * FUSION_CHANNELS + 2 * s + 1];
-            float amp = sqrtf(real * real + imag * imag);
-            sum += amp;
-            sum_sq += amp * amp;
-        }
-        float mean = sum / (float)SLIDING_WINDOW_SIZE;
-        float var = (sum_sq / (float)SLIDING_WINDOW_SIZE) - (mean * mean);
-        if (var < 0.0f) {
-            var = 0.0f;
-        }
-        float std = sqrtf(var);
-        std_sum += std;
+    if (res->is_final) {
+        // 在这里编写您的 OLED 驱动库显示代码，例如：
+        // oled_draw_string(0, 0, "Gesture: %s", res->class_name);
+        // oled_draw_string(0, 16, "Conf: %.1f%%", res->confidence * 100.0f);
+        // oled_refresh();
     }
-    return std_sum / (float)NUM_SUBCARRIERS;
 }
 
-// ==================== 6. 核心任务定义 ====================
+// 示例 2: HTTP 发送异步回调（发起网络连接通常耗时几百毫秒，注册为异步，保证时序稳定）
+static void http_post_output_cb(const inference_result_t *res)
+{
+    if (res->is_final) {
+        // 在这里发起您的 HTTP POST 请求上传推理结果：
+        // esp_http_client_config_t config = { .url = "http://my-server.com/api/gesture", ... };
+        // esp_http_client_handle_t client = esp_http_client_init(&config);
+        // esp_http_client_set_post_field(client, post_data, strlen(post_data));
+        // esp_http_client_perform(client);
+        // esp_http_client_cleanup(client);
+    }
+}
+*/
+
+// ==================== 4. 双核执行任务 ====================
 
 /**
  * @brief Core 1 任务: AI模型推理
@@ -258,12 +108,6 @@ static void ai_inference_task(void *pvParameters)
     float unweighted_probs[NUM_CLASSES] = {0.0f};
     float total_weight = 0.0f;
     int gesture_frames_count = 0;
-    
-    const char *gesture_names[NUM_CLASSES] = {
-        "高抬腿",
-        "展臂",
-        "深蹲"
-    };
     
     // Real-time smoothing history
     #define SMOOTHING_FRAMES 7
@@ -293,11 +137,16 @@ static void ai_inference_task(void *pvParameters)
             int64_t start = esp_timer_get_time();
             int pred_class = nn_model_predict_cnn_with_probs(local_input, probs);
             int64_t end = esp_timer_get_time();
+            uint32_t execution_time_us = (uint32_t)(end - start);
             
             float confidence = probs[pred_class];
             
+            // 从配置模块动态获取当前配置
+            float motion_threshold = sys_config_get_motion_threshold();
+            float min_confidence = sys_config_get_min_confidence();
+            
             // 计算加权系数 (motion_val - threshold)^2
-            float weight = (local_motion_val - MOTION_THRESHOLD) * (local_motion_val - MOTION_THRESHOLD);
+            float weight = (local_motion_val - motion_threshold) * (local_motion_val - motion_threshold);
             
             // 过滤置信度低于0.50的帧，参与最终的决策累加
             if (confidence >= 0.50f) {
@@ -310,7 +159,7 @@ static void ai_inference_task(void *pvParameters)
             }
             
             // 检查置信度是否大于等于阈值以推入平滑历史
-            if (confidence >= MIN_CONFIDENCE) {
+            if (confidence >= min_confidence) {
                 if (pred_history_count < SMOOTHING_FRAMES) {
                     pred_history[pred_history_count++] = pred_class;
                 } else {
@@ -337,17 +186,37 @@ static void ai_inference_task(void *pvParameters)
                 }
             }
             
-            if (smoothed_class != -1) {
-                const char *name = (smoothed_class < NUM_CLASSES && gesture_names[smoothed_class]) ? gesture_names[smoothed_class] : "Unknown";
-                ESP_LOGI(TAG, "🔴 [ACTIVE] Real-time Pred: %s (Conf: %.1f%%, Motion: %.2f, Time: %lld us)", 
-                         name, confidence * 100.0f, local_motion_val, (end - start));
-            } else {
-                ESP_LOGI(TAG, "🔴 [ACTIVE] Real-time Pred: UNCERTAIN (Motion: %.2f)", local_motion_val);
-            }
+            // 构造推理结果对象
+            inference_result_t active_res = {
+                .class_id = smoothed_class,
+                .class_name = (smoothed_class >= 0 && smoothed_class < NUM_CLASSES && gesture_names[smoothed_class]) ? gesture_names[smoothed_class] : "Unknown",
+                .confidence = (smoothed_class != -1) ? probs[smoothed_class] : 0.0f,
+                .motion_val = local_motion_val,
+                .is_final = false,
+                .execution_time_us = execution_time_us,
+                .total_weight = 0.0f,
+                .accum_frames = 0
+            };
+            memcpy(active_res.probs, probs, sizeof(probs));
+            
+            // 通过输出分发器广播给所有 IO 设备
+            output_dispatcher_dispatch(&active_res);
         }
         
         if (local_ended) {
             // 动作结束，进行加权总决策
+            inference_result_t final_res = {
+                .class_id = -1,
+                .class_name = "Unknown",
+                .confidence = 0.0f,
+                .motion_val = local_motion_val,
+                .is_final = true,
+                .execution_time_us = 0,
+                .total_weight = total_weight,
+                .accum_frames = gesture_frames_count
+            };
+            memset(final_res.probs, 0, sizeof(final_res.probs));
+
             if (gesture_frames_count > 0) {
                 float final_probs[NUM_CLASSES];
                 if (total_weight > 0.0f) {
@@ -357,8 +226,9 @@ static void ai_inference_task(void *pvParameters)
                 } else {
                     for (int c = 0; c < NUM_CLASSES; c++) {
                         final_probs[c] = unweighted_probs[c] / (float)gesture_frames_count;
-                      }
+                    }
                 }
+                
                 // 在所有动作分类中寻找最大概率值 (argmax over classes)
                 int final_class = 0;
                 float max_prob = final_probs[0];
@@ -369,20 +239,14 @@ static void ai_inference_task(void *pvParameters)
                     }
                 }
                 
-                ESP_LOGI(TAG, "================ GESTURE DETECTED ================");
-                const char *final_name = (final_class < NUM_CLASSES && gesture_names[final_class]) ? gesture_names[final_class] : "Unknown";
-                ESP_LOGI(TAG, "🏆🏆🏆 Final Result: %s (Score: %.1f%%)", final_name, max_prob * 100.0f);
-                for (int c = 0; c < NUM_CLASSES; c++) {
-                    const char *name = (c < NUM_CLASSES && gesture_names[c]) ? gesture_names[c] : "Unknown";
-                    ESP_LOGI(TAG, "      - Class %d (%s) Prob: %.2f%%", c, name, final_probs[c] * 100.0f);
-                }
-                ESP_LOGI(TAG, "      - Accum Frames: %d, Total Weight: %.2f", gesture_frames_count, total_weight);
-                ESP_LOGI(TAG, "==================================================");
-            } else {
-                ESP_LOGI(TAG, "================ GESTURE DETECTED ================");
-                ESP_LOGI(TAG, "⚠️⚠️⚠️ Finished, but no high-confidence frames accumulated.");
-                ESP_LOGI(TAG, "==================================================");
+                final_res.class_id = final_class;
+                final_res.class_name = (final_class < NUM_CLASSES && gesture_names[final_class]) ? gesture_names[final_class] : "Unknown";
+                final_res.confidence = max_prob;
+                memcpy(final_res.probs, final_probs, sizeof(final_probs));
             }
+            
+            // 分发最终决策结果
+            output_dispatcher_dispatch(&final_res);
             
             // 重置累加状态与平滑历史
             memset(accumulated_probs, 0, sizeof(accumulated_probs));
@@ -408,112 +272,112 @@ static void csi_uart_rx_task(void *pvParameters)
         return;
     }
     
-    static float new_frame[FUSION_CHANNELS];
+    // 创建运动检测器实例
+    motion_detector_t *detector = motion_detector_create();
+    if (!detector) {
+        ESP_LOGE(TAG, "Failed to create motion detector!");
+        free(csi_raw_payload);
+        vTaskDelete(NULL);
+        return;
+    }
     
-    bool is_moving = false;
-    int motion_trigger_counter = 0;
-    int idle_counter = 0;
+    // 在 PSRAM 分配临时缓冲区，用于在状态机动作期间将滑动窗口内容送至双缓冲共享区
+    float *temp_window_buf = (float *)heap_caps_malloc(TOTAL_FEATURES * sizeof(float), MALLOC_CAP_SPIRAM);
+    if (!temp_window_buf) {
+        ESP_LOGE(TAG, "Failed to allocate temp window buffer!");
+        motion_detector_destroy(detector);
+        free(csi_raw_payload);
+        vTaskDelete(NULL);
+        return;
+    }
     
     uint32_t seq = 0;
     size_t raw_len = 0;
     
     while (true) {
-        if (read_csi_frame(&seq, csi_raw_payload, &raw_len)) {
-            // 解析并对齐子载波
-            parse_and_filter_csi(csi_raw_payload, raw_len, new_frame);
+        // 读取并同步串口数据帧
+        if (csi_receiver_read_frame(&seq, csi_raw_payload, &raw_len)) {
+            float motion_val = 0.0f;
+            bool is_started = false;
+            bool is_ended = false;
             
-            // 写入滑动窗口
-            if (csi_window_count < SLIDING_WINDOW_SIZE) {
-                memcpy(csi_window + csi_window_count * FUSION_CHANNELS, new_frame, sizeof(new_frame));
-                csi_window_count++;
-            } else {
-                // 滑动左移1帧，并将新帧追加在尾部
-                memmove(csi_window, csi_window + FUSION_CHANNELS, (SLIDING_WINDOW_SIZE - 1) * FUSION_CHANNELS * sizeof(float));
-                memcpy(csi_window + (SLIDING_WINDOW_SIZE - 1) * FUSION_CHANNELS, new_frame, sizeof(new_frame));
-            }
+            // 输入状态机处理
+            bool req_inference = motion_detector_process_frame(
+                detector, csi_raw_payload, raw_len, 
+                &motion_val, temp_window_buf, &is_started, &is_ended
+            );
             
-            // 当滑动窗口攒满50帧后，触发计算标准差与状态机
-            if (csi_window_count == SLIDING_WINDOW_SIZE) {
-                float motion_val = calculate_motion_level(csi_window);
-                
-                if (motion_val >= MOTION_THRESHOLD) {
-                    idle_counter = 0;
-                    if (!is_moving) {
-                        motion_trigger_counter++;
-                        if (motion_trigger_counter >= REQUIRED_TRIGGER_FRAMES) {
-                            is_moving = true;
-                            ESP_LOGI(TAG, "🔴 [MOTION DETECTED] Gesture started! (Motion Level: %.2f)", motion_val);
-                        }
-                    }
-                    
-                    if (is_moving) {
-                        // 利用双缓冲区异步推送给Core 1进行AI推理，防止卡死Core 0的串口接收中断
-                        portENTER_CRITICAL(&sync_mux);
-                        if (!inference_request_pending) {
-                            memcpy(inference_input_buf, csi_window, TOTAL_FEATURES * sizeof(float));
-                            inference_motion_val = motion_val;
-                            inference_request_pending = true;
-                            if (ai_task_handle != NULL) {
-                                xTaskNotifyGive(ai_task_handle);
-                            }
-                        }
-                        portEXIT_CRITICAL(&sync_mux);
-                    }
-                } else {
-                    if (is_moving) {
-                        motion_trigger_counter = 0;
-                        idle_counter++;
-                        
-                        if (idle_counter >= DEBOUNCE_FRAMES) {
-                            is_moving = false;
-                            
-                            // 通知Core 1动作结束并计算最终决策
-                            portENTER_CRITICAL(&sync_mux);
-                            gesture_ended_pending = true;
-                            if (ai_task_handle != NULL) {
-                                xTaskNotifyGive(ai_task_handle);
-                            }
-                            portEXIT_CRITICAL(&sync_mux);
-                            
-                            ESP_LOGI(TAG, "⚪ [MOTION ENDED] Returning to standby.");
-                        }
-                    } else {
-                        motion_trigger_counter = 0;
+            // 动作帧：双缓冲区安全推送给 Core 1 推理线程，避免直接在 Core 0 运行时造成串口丢帧
+            if (req_inference) {
+                portENTER_CRITICAL(&sync_mux);
+                if (!inference_request_pending) {
+                    memcpy(inference_input_buf, temp_window_buf, TOTAL_FEATURES * sizeof(float));
+                    inference_motion_val = motion_val;
+                    inference_request_pending = true;
+                    if (ai_task_handle != NULL) {
+                        xTaskNotifyGive(ai_task_handle);
                     }
                 }
+                portEXIT_CRITICAL(&sync_mux);
+            }
+            
+            // 动作结束帧：推送结束标志并激活 Core 1 进行最终加权投票统计
+            if (is_ended) {
+                portENTER_CRITICAL(&sync_mux);
+                gesture_ended_pending = true;
+                if (ai_task_handle != NULL) {
+                    xTaskNotifyGive(ai_task_handle);
+                }
+                portEXIT_CRITICAL(&sync_mux);
             }
         }
         
         vTaskDelay(pdMS_TO_TICKS(1));
     }
     
+    heap_caps_free(temp_window_buf);
+    motion_detector_destroy(detector);
     free(csi_raw_payload);
     vTaskDelete(NULL);
 }
 
-// ==================== 7. 主函数入口 ====================
+// ==================== 5. 主函数入口 ====================
 void app_main(void)
 {
-    ESP_LOGI(TAG, "======= ESP32-P4 WiFi CSI Inference Startup =======");
+    ESP_LOGI(TAG, "======= ESP32-P4 WiFi CSI Inference Startup (Refactored) =======");
 
-    // 1. 在 PSRAM 中动态分配滑动窗口
-    csi_window = (float *)heap_caps_malloc(TOTAL_FEATURES * sizeof(float), MALLOC_CAP_SPIRAM);
+    // 1. 初始化动态配置中心
+    sys_config_init();
+
+    // 2. 初始化输出分发器，并注册默认控制台同步输出回调
+    ESP_ERROR_CHECK(output_dispatcher_init());
+    ESP_ERROR_CHECK(output_dispatcher_register_sync(console_logger_cb));
+
+    /*
+    // 在这里，您可以轻松注册更多的外设输出通道，例如：
+    // 注册异步刷新 OLED 的回调 (以防止 OLED I2C 刷屏慢阻塞 AI 任务)
+    ESP_ERROR_CHECK(output_dispatcher_register_async(oled_output_cb));
+    
+    // 注册异步发送 HTTP 的回调 (网络请求耗时长，必须置于后台异步执行)
+    ESP_ERROR_CHECK(output_dispatcher_register_async(http_post_output_cb));
+    */
+
+    // 3. 在 PSRAM 中动态分配推理交互使用的双缓冲区
     inference_input_buf = (float *)heap_caps_malloc(TOTAL_FEATURES * sizeof(float), MALLOC_CAP_SPIRAM);
-    if (!csi_window || !inference_input_buf) {
+    if (!inference_input_buf) {
         ESP_LOGE(TAG, "Failed to allocate CSI window buffers in PSRAM!");
         return;
     }
-    memset(csi_window, 0, TOTAL_FEATURES * sizeof(float));
     memset(inference_input_buf, 0, TOTAL_FEATURES * sizeof(float));
 
-    // 2. 初始化 UART 串口外设
-    if (init_csi_uart() != ESP_OK) {
+    // 4. 初始化 UART 接收物理通道
+    if (csi_receiver_init() != ESP_OK) {
         ESP_LOGE(TAG, "CSI UART Init failed! System halted.");
         return;
     }
     
-    // 3. 创建核心任务并绑定CPU
-    // Pinned to APP_CPU (Core 1) for Neural Network inference (降低栈大小至 4096 words/16KB)
+    // 5. 创建核心任务并绑定CPU
+    // Pinned to APP_CPU (Core 1) for Neural Network inference
     xTaskCreatePinnedToCore(
         ai_inference_task,
         "ai_inference_task",
@@ -524,7 +388,7 @@ void app_main(void)
         1
     );
 
-    // Pinned to PRO_CPU (Core 0) for UART IO & State Machine (降低栈大小至 3072 words/12KB)
+    // Pinned to PRO_CPU (Core 0) for UART IO & State Machine
     xTaskCreatePinnedToCore(
         csi_uart_rx_task,
         "csi_uart_rx_task",
