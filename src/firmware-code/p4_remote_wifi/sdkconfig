@@ -764,6 +764,14 @@ CONFIG_PARTITION_TABLE_MD5=y
 # end of Partition Table
 
 #
+# Project Config
+#
+CONFIG_ddloom_base_url="http://192.168.0.2:8080"
+CONFIG_ddloom_WIFI_SSID="Lixeer"
+CONFIG_ddloom_WIFI_PASSWORD="cwb20051027"
+# end of Project Config
+
+#
 # Compiler options
 #
 # CONFIG_COMPILER_OPTIMIZATION_DEBUG is not set
