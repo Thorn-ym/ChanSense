@@ -407,22 +407,47 @@ static void oled_draw_param_screen(void)
 static void oled_draw_model_screen(void)
 {
     char line[32];
+    int count = nn_model_get_slot_count();
+    const int visible_rows = 4;
 
     oled_clear_fb();
     oled_draw_text_center(0, "SELECT MODEL", false);
-    for (int i = 0; i < nn_model_get_slot_count(); i++) {
-        bool selected = (i == g_model_cursor);
-        const char *state = nn_model_is_installed(i) ? "READY" : "EMPTY";
-        int page = 2 + i;
+    if (count <= 0) {
+        oled_draw_text_center(3, "NO SD MODEL", false);
+        oled_draw_text_center(6, "CHECK SD", false);
+        oled_flush();
+        return;
+    }
+
+    int start = g_model_cursor - visible_rows + 1;
+    if (start < 0) {
+        start = 0;
+    }
+    if (start > count - visible_rows) {
+        start = count - visible_rows;
+    }
+    if (start < 0) {
+        start = 0;
+    }
+
+    for (int row = 0; row < visible_rows && start + row < count; row++) {
+        int model_id = start + row;
+        bool selected = (model_id == g_model_cursor);
+        const char *state = nn_model_is_installed(model_id) ? "READY" : "EMPTY";
+        int page = 2 + row;
 
         if (selected) {
             oled_fill_page(page, 0xff);
         }
-        snprintf(line, sizeof(line), "%s", nn_model_get_slot_name(i));
+        snprintf(line, sizeof(line), "%s", nn_model_get_slot_name(model_id));
         oled_draw_text_ex(6, page, line, selected);
         oled_draw_text_right(124, page, state, selected);
     }
-    oled_draw_text_center(6, "CLICK OK", false);
+    snprintf(line, sizeof(line), "%u/%u",
+             (unsigned)(g_model_cursor + 1),
+             (unsigned)count);
+    oled_draw_text(0, 7, line);
+    oled_draw_text_right(124, 7, "CLICK OK", false);
     oled_flush();
 }
 
@@ -564,6 +589,10 @@ static void handle_encoder_delta(int delta)
 
     if (g_screen == UI_SCREEN_MODEL_SELECT) {
         int count = nn_model_get_slot_count();
+        if (count <= 0) {
+            ui_render();
+            return;
+        }
         g_model_cursor = (g_model_cursor + delta) % count;
         if (g_model_cursor < 0) {
             g_model_cursor += count;
@@ -583,7 +612,10 @@ static void handle_short_click(void)
     }
 
     if (g_screen == UI_SCREEN_MODEL_SELECT) {
-        if (nn_model_is_installed(g_model_cursor)) {
+        int count = nn_model_get_slot_count();
+        if (count <= 0) {
+            enter_notice("NO SD MODEL", 1200);
+        } else if (nn_model_is_installed(g_model_cursor)) {
             if (nn_model_select(g_model_cursor) == ESP_OK) {
                 g_screen = UI_SCREEN_PARAMS;
                 ui_render();
@@ -591,7 +623,7 @@ static void handle_short_click(void)
                 enter_notice("MODEL ERR", 1200);
             }
         } else {
-            enter_notice("MODEL 2 EMPTY", 1200);
+            enter_notice("MODEL EMPTY", 1200);
         }
         return;
     }
@@ -602,8 +634,17 @@ static void handle_short_click(void)
 
 static void handle_long_press(void)
 {
+    if (nn_model_get_slot_count() <= 0) {
+        nn_model_rescan();
+    }
     g_screen = UI_SCREEN_MODEL_SELECT;
     g_model_cursor = nn_model_get_active_id();
+    int count = nn_model_get_slot_count();
+    if (count <= 0) {
+        g_model_cursor = 0;
+    } else if (g_model_cursor >= count) {
+        g_model_cursor = count - 1;
+    }
     ui_render();
 }
 

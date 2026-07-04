@@ -5,7 +5,7 @@
 #include "esp_err.h"
 
 #define NUM_CLASSES 4
-#define NN_MODEL_SLOT_COUNT 2
+#define NN_MODEL_MAX_SLOT_COUNT 8
 
 #ifdef __cplusplus
 extern "C" {
@@ -15,6 +15,11 @@ extern "C" {
  * @brief Initialize the quadrant classifier model (loads model into memory)
  */
 void nn_model_init(void);
+
+/**
+ * @brief Rescan SD card model files without changing the active model.
+ */
+void nn_model_rescan(void);
 
 /**
  * @brief Return the number of supported model slots.
