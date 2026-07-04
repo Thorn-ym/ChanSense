@@ -9,10 +9,12 @@
 #include "esp_vfs_fat.h"
 #include "sd_pwr_ctrl_by_on_chip_ldo.h"
 #include "sdmmc_cmd.h"
+#include "cJSON.h"
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <dirent.h>
+#include <cstdlib>
 #include <map>
 #include <strings.h>
 #include <sys/stat.h>
@@ -24,6 +26,7 @@
 #define SD_LEGACY_MODEL_DIR SD_MOUNT_POINT "/sdcard_models"
 #define MODEL_NAME_MAX_LEN 24
 #define MODEL_PATH_MAX_LEN 96
+#define MODEL_META_MAX_BYTES (8 * 1024)
 
 static constexpr gpio_num_t SD_PWR_EN_GPIO = GPIO_NUM_45;
 static constexpr int SDMMC_IO_LDO_CHAN_ID = 4;
@@ -32,8 +35,11 @@ static constexpr int SD_CARD_SDMMC_SLOT = SDMMC_HOST_SLOT_0;
 typedef struct {
     char name[MODEL_NAME_MAX_LEN];
     char path[MODEL_PATH_MAX_LEN];
+    char meta_path[MODEL_PATH_MAX_LEN];
     long size;
-    const char *class_names[NUM_CLASSES];
+    int class_count;
+    bool metadata_loaded;
+    char class_names[NN_MODEL_MAX_CLASS_COUNT][NN_MODEL_CLASS_NAME_MAX_LEN];
     dl::Model *model;
     dl::TensorBase *input;
     dl::TensorBase *output;
@@ -50,10 +56,12 @@ static int g_active_model_id = 0;
 static dl::Model *g_model = nullptr;
 static dl::TensorBase *g_model_input = nullptr;
 static dl::TensorBase *g_model_output = nullptr;
+static int g_active_class_count = 4;
 
-static const char *const DEFAULT_CLASS_NAMES[NUM_CLASSES] = {
+static const char *const DEFAULT_CLASS_NAMES[] = {
     "高抬腿", "展臂", "深蹲", "Unknown"
 };
+static constexpr int DEFAULT_CLASS_COUNT = sizeof(DEFAULT_CLASS_NAMES) / sizeof(DEFAULT_CLASS_NAMES[0]);
 
 static bool is_valid_model_id(int model_id)
 {
@@ -107,6 +115,241 @@ static void copy_model_display_name(char *dst, size_t dst_size, const char *file
 
     if (dst[0] == '\0') {
         copy_truncated(dst, dst_size, "MODEL");
+    }
+}
+
+static void set_default_class_names(model_slot_t *slot)
+{
+    if (!slot) {
+        return;
+    }
+
+    slot->class_count = DEFAULT_CLASS_COUNT;
+    slot->metadata_loaded = false;
+    for (int i = 0; i < NN_MODEL_MAX_CLASS_COUNT; i++) {
+        if (i < DEFAULT_CLASS_COUNT) {
+            copy_truncated(slot->class_names[i], sizeof(slot->class_names[i]), DEFAULT_CLASS_NAMES[i]);
+        } else {
+            snprintf(slot->class_names[i], sizeof(slot->class_names[i]), "Class %d", i);
+        }
+    }
+}
+
+static bool replace_extension(char *dst, size_t dst_size, const char *path, const char *extension)
+{
+    if (!dst || dst_size == 0 || !path || !extension) {
+        return false;
+    }
+
+    copy_truncated(dst, dst_size, path);
+    char *dot = strrchr(dst, '.');
+    if (!dot) {
+        return false;
+    }
+
+    size_t prefix_len = (size_t)(dot - dst);
+    size_t ext_len = strlen(extension);
+    if (prefix_len + ext_len >= dst_size) {
+        dst[0] = '\0';
+        return false;
+    }
+
+    memcpy(dst + prefix_len, extension, ext_len + 1);
+    return true;
+}
+
+static bool file_exists(const char *path)
+{
+    struct stat st;
+    return path && stat(path, &st) == 0 && !S_ISDIR(st.st_mode);
+}
+
+static cJSON *read_json_file(const char *path)
+{
+    if (!path || !file_exists(path)) {
+        return nullptr;
+    }
+
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        ESP_LOGW(TAG, "metadata open failed: %s", path);
+        return nullptr;
+    }
+
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return nullptr;
+    }
+    long size = ftell(fp);
+    if (size <= 0 || size > MODEL_META_MAX_BYTES) {
+        fclose(fp);
+        ESP_LOGD(TAG, "skip non-metadata-sized json: %s (%ld bytes)", path, size);
+        return nullptr;
+    }
+    rewind(fp);
+
+    char *buf = (char *)malloc((size_t)size + 1);
+    if (!buf) {
+        fclose(fp);
+        ESP_LOGW(TAG, "metadata allocation failed: %s", path);
+        return nullptr;
+    }
+
+    size_t read_len = fread(buf, 1, (size_t)size, fp);
+    fclose(fp);
+    buf[read_len] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
+    if (!root) {
+        ESP_LOGW(TAG, "metadata parse failed: %s", path);
+    }
+    return root;
+}
+
+static cJSON *get_json_item_any(cJSON *root, const char *name_a, const char *name_b)
+{
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(root, name_a);
+    if (!item && name_b) {
+        item = cJSON_GetObjectItemCaseSensitive(root, name_b);
+    }
+    return item;
+}
+
+static bool load_model_metadata_from_json(model_slot_t *slot, const char *path)
+{
+    cJSON *root = read_json_file(path);
+    if (!root) {
+        return false;
+    }
+
+    cJSON *labels = get_json_item_any(root, "labels", "classes");
+    if (!cJSON_IsArray(labels)) {
+        cJSON_Delete(root);
+        return false;
+    }
+
+    int label_count = cJSON_GetArraySize(labels);
+    if (label_count <= 0 || label_count > NN_MODEL_MAX_CLASS_COUNT) {
+        ESP_LOGW(TAG, "metadata label count out of range: %s (%d)", path, label_count);
+        cJSON_Delete(root);
+        return false;
+    }
+
+    cJSON *class_count_item = get_json_item_any(root, "num_classes", "class_count");
+    int class_count = cJSON_IsNumber(class_count_item) ? class_count_item->valueint : label_count;
+    if (class_count != label_count) {
+        ESP_LOGW(TAG, "metadata class count mismatch: %s (%d labels, count=%d)",
+                 path,
+                 label_count,
+                 class_count);
+        cJSON_Delete(root);
+        return false;
+    }
+
+    cJSON *name = get_json_item_any(root, "name", "display_name");
+    if (cJSON_IsString(name) && name->valuestring && name->valuestring[0] != '\0') {
+        copy_truncated(slot->name, sizeof(slot->name), name->valuestring);
+    }
+
+    slot->class_count = class_count;
+    for (int i = 0; i < class_count; i++) {
+        cJSON *label = cJSON_GetArrayItem(labels, i);
+        if (!cJSON_IsString(label) || !label->valuestring || label->valuestring[0] == '\0') {
+            ESP_LOGW(TAG, "metadata label %d invalid: %s", i, path);
+            cJSON_Delete(root);
+            set_default_class_names(slot);
+            return false;
+        }
+        copy_truncated(slot->class_names[i], sizeof(slot->class_names[i]), label->valuestring);
+    }
+    for (int i = class_count; i < NN_MODEL_MAX_CLASS_COUNT; i++) {
+        snprintf(slot->class_names[i], sizeof(slot->class_names[i]), "Class %d", i);
+    }
+
+    copy_truncated(slot->meta_path, sizeof(slot->meta_path), path);
+    slot->metadata_loaded = true;
+    ESP_LOGI(TAG, "loaded metadata for %s: %d classes from %s", slot->name, slot->class_count, path);
+    cJSON_Delete(root);
+    return true;
+}
+
+static void load_model_metadata(model_slot_t *slot)
+{
+    char meta_path[MODEL_PATH_MAX_LEN];
+
+    if (replace_extension(meta_path, sizeof(meta_path), slot->path, ".meta.json") &&
+        load_model_metadata_from_json(slot, meta_path)) {
+        return;
+    }
+
+    if (replace_extension(meta_path, sizeof(meta_path), slot->path, ".labels.json") &&
+        load_model_metadata_from_json(slot, meta_path)) {
+        return;
+    }
+
+    if (replace_extension(meta_path, sizeof(meta_path), slot->path, ".json") &&
+        load_model_metadata_from_json(slot, meta_path)) {
+        return;
+    }
+
+    ESP_LOGW(TAG,
+             "no usable metadata found for %s; using default %d-class labels",
+             slot->path,
+             DEFAULT_CLASS_COUNT);
+}
+
+static int infer_output_class_count(dl::TensorBase *output)
+{
+    if (!output) {
+        return 0;
+    }
+
+    int size = output->get_size();
+    if (size <= 0 || size > NN_MODEL_MAX_CLASS_COUNT) {
+        ESP_LOGW(TAG, "model output size out of supported range: %d (max=%d)",
+                 size,
+                 NN_MODEL_MAX_CLASS_COUNT);
+        return 0;
+    }
+    return size;
+}
+
+static void free_model_slots(void)
+{
+    for (int i = 0; i < g_model_slot_count; i++) {
+        if (g_model_slots[i].model != nullptr) {
+            delete g_model_slots[i].model;
+            g_model_slots[i].model = nullptr;
+        }
+        g_model_slots[i].input = nullptr;
+        g_model_slots[i].output = nullptr;
+    }
+    g_model = nullptr;
+    g_model_input = nullptr;
+    g_model_output = nullptr;
+    g_active_model_id = 0;
+    g_active_class_count = DEFAULT_CLASS_COUNT;
+}
+
+static float tensor_value_as_float(dl::TensorBase *tensor, int index)
+{
+    if (!tensor) {
+        return 0.0f;
+    }
+
+    switch (tensor->get_dtype()) {
+    case dl::DATA_TYPE_INT8:
+        return (float)tensor->get_element_ptr<int8_t>()[index] * std::pow(2.0f, tensor->get_exponent());
+    case dl::DATA_TYPE_INT16:
+        return (float)tensor->get_element_ptr<int16_t>()[index] * std::pow(2.0f, tensor->get_exponent());
+    case dl::DATA_TYPE_INT32:
+        return (float)tensor->get_element_ptr<int32_t>()[index] * std::pow(2.0f, tensor->get_exponent());
+    case dl::DATA_TYPE_FLOAT:
+        return tensor->get_element_ptr<float>()[index];
+    default:
+        ESP_LOGW(TAG, "unsupported output dtype: %s", tensor->get_dtype_string());
+        return 0.0f;
     }
 }
 
@@ -212,14 +455,14 @@ static bool add_model_file(const char *path)
     copy_model_display_name(slot->name, sizeof(slot->name), path);
     copy_truncated(slot->path, sizeof(slot->path), path);
     slot->size = (long)st.st_size;
-    for (int i = 0; i < NUM_CLASSES; i++) {
-        slot->class_names[i] = DEFAULT_CLASS_NAMES[i];
-    }
+    set_default_class_names(slot);
+    load_model_metadata(slot);
 
-    ESP_LOGI(TAG, "found SD model %d: %s (%ld bytes)",
+    ESP_LOGI(TAG, "found SD model %d: %s (%ld bytes, %d classes)",
              g_model_slot_count,
              slot->path,
-             slot->size);
+             slot->size,
+             slot->class_count);
     g_model_slot_count++;
     return true;
 }
@@ -255,6 +498,7 @@ static void scan_model_dir(const char *dir_path)
 
 static void scan_sd_models(void)
 {
+    free_model_slots();
     g_model_slot_count = 0;
     memset(g_model_slots, 0, sizeof(g_model_slots));
 
@@ -314,9 +558,36 @@ static esp_err_t ensure_model_loaded(int model_id)
 
     slot->input = model_inputs.begin()->second;
     slot->output = model_outputs.begin()->second;
-    ESP_LOGI(TAG, "%s loaded. Size: %ld bytes, Input Exp: %d, Output Exp: %d",
+    int output_class_count = infer_output_class_count(slot->output);
+    if (output_class_count <= 0) {
+        delete slot->model;
+        slot->model = nullptr;
+        slot->input = nullptr;
+        slot->output = nullptr;
+        return ESP_FAIL;
+    }
+
+    if (slot->metadata_loaded) {
+        if (slot->class_count != output_class_count) {
+            ESP_LOGE(TAG,
+                     "%s metadata class count (%d) does not match model output (%d)",
+                     slot->name,
+                     slot->class_count,
+                     output_class_count);
+            delete slot->model;
+            slot->model = nullptr;
+            slot->input = nullptr;
+            slot->output = nullptr;
+            return ESP_ERR_INVALID_SIZE;
+        }
+    } else {
+        slot->class_count = output_class_count;
+    }
+
+    ESP_LOGI(TAG, "%s loaded. Size: %ld bytes, Classes: %d, Input Exp: %d, Output Exp: %d",
              slot->name,
              slot->size,
+             slot->class_count,
              slot->input->get_exponent(),
              slot->output->get_exponent());
     return ESP_OK;
@@ -372,8 +643,9 @@ esp_err_t nn_model_select(int model_id)
     g_model = slot->model;
     g_model_input = slot->input;
     g_model_output = slot->output;
+    g_active_class_count = slot->class_count;
     sys_config_set_active_model_id(model_id);
-    ESP_LOGI(TAG, "Active model switched to %s", slot->name);
+    ESP_LOGI(TAG, "Active model switched to %s (%d classes)", slot->name, g_active_class_count);
     return ESP_OK;
 }
 
@@ -387,6 +659,19 @@ const char *nn_model_get_active_name(void)
     return nn_model_get_slot_name(g_active_model_id);
 }
 
+int nn_model_get_class_count(void)
+{
+    return g_active_class_count;
+}
+
+int nn_model_get_slot_class_count(int model_id)
+{
+    if (!is_valid_model_id(model_id)) {
+        return 0;
+    }
+    return g_model_slots[model_id].class_count;
+}
+
 const char *nn_model_get_slot_name(int model_id)
 {
     if (!is_valid_model_id(model_id)) {
@@ -397,11 +682,11 @@ const char *nn_model_get_slot_name(int model_id)
 
 const char *nn_model_get_class_name(int class_id)
 {
-    if (class_id < 0 || class_id >= NUM_CLASSES || !is_valid_model_id(g_active_model_id)) {
+    if (class_id < 0 || class_id >= g_active_class_count || !is_valid_model_id(g_active_model_id)) {
         return "Unknown";
     }
     const char *name = g_model_slots[g_active_model_id].class_names[class_id];
-    return name ? name : "Unknown";
+    return name[0] != '\0' ? name : "Unknown";
 }
 
 int nn_model_predict(float x, float y)
@@ -426,14 +711,18 @@ int nn_model_predict(float x, float y)
     g_model->run();
 
     // Read quantized outputs
-    int8_t *output_data = (int8_t *)g_model_output->data;
+    int class_count = nn_model_get_class_count();
+    if (class_count <= 0) {
+        return -1;
+    }
 
     // Find class with the maximum score (argmax)
     int max_class = 0;
-    int8_t max_val = output_data[0];
-    for (int c = 1; c < NUM_CLASSES; c++) {
-        if (output_data[c] > max_val) {
-            max_val = output_data[c];
+    float max_val = tensor_value_as_float(g_model_output, 0);
+    for (int c = 1; c < class_count; c++) {
+        float val = tensor_value_as_float(g_model_output, c);
+        if (val > max_val) {
+            max_val = val;
             max_class = c;
         }
     }
@@ -478,14 +767,18 @@ int nn_model_predict_cnn(float *raw_csi)
     g_model->run();
 
     // Read output tensor data
-    int8_t *output_data = (int8_t *)g_model_output->data;
+    int class_count = nn_model_get_class_count();
+    if (class_count <= 0) {
+        return -1;
+    }
 
     // Find class with the maximum score (argmax among classes)
     int max_class = 0;
-    int8_t max_val = output_data[0];
-    for (int c = 1; c < NUM_CLASSES; c++) {
-        if (output_data[c] > max_val) {
-            max_val = output_data[c];
+    float max_val = tensor_value_as_float(g_model_output, 0);
+    for (int c = 1; c < class_count; c++) {
+        float val = tensor_value_as_float(g_model_output, c);
+        if (val > max_val) {
+            max_val = val;
             max_class = c;
         }
     }
@@ -532,26 +825,36 @@ int nn_model_predict_cnn_with_probs(float *raw_csi, float *out_probs)
     // Run forward pass
     g_model->run();
 
-    // Read output tensor data
-    int8_t *output_data = (int8_t *)g_model_output->data;
-    int output_exponent = g_model_output->get_exponent();
-    float output_scale = std::pow(2.0f, output_exponent);
+    int class_count = nn_model_get_class_count();
+    if (class_count <= 0) {
+        return -1;
+    }
 
     // Calculate Softmax probabilities
     float sum_exp = 0.0f;
-    float float_logits[NUM_CLASSES];
-    for (int c = 0; c < NUM_CLASSES; c++) {
-        float_logits[c] = (float)output_data[c] * output_scale;
-        sum_exp += expf(float_logits[c]);
+    float float_logits[NN_MODEL_MAX_CLASS_COUNT];
+    float max_logit = tensor_value_as_float(g_model_output, 0);
+    for (int c = 1; c < class_count; c++) {
+        float val = tensor_value_as_float(g_model_output, c);
+        if (val > max_logit) {
+            max_logit = val;
+        }
     }
-    for (int c = 0; c < NUM_CLASSES; c++) {
-        out_probs[c] = expf(float_logits[c]) / sum_exp;
+    for (int c = 0; c < class_count; c++) {
+        float_logits[c] = tensor_value_as_float(g_model_output, c);
+        sum_exp += expf(float_logits[c] - max_logit);
+    }
+    for (int c = 0; c < class_count; c++) {
+        out_probs[c] = expf(float_logits[c] - max_logit) / sum_exp;
+    }
+    for (int c = class_count; c < NN_MODEL_MAX_CLASS_COUNT; c++) {
+        out_probs[c] = 0.0f;
     }
 
     // Find class with the maximum score
     int max_class = 0;
     float max_prob = out_probs[0];
-    for (int c = 1; c < NUM_CLASSES; c++) {
+    for (int c = 1; c < class_count; c++) {
         if (out_probs[c] > max_prob) {
             max_prob = out_probs[c];
             max_class = c;
